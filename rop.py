@@ -10,7 +10,7 @@ def get_gadgets(fname: str, all_gadgets: Optional[bool] = False, inst_count: Opt
 
     rs = RopperService(options)
 
-    rs.addFile(fname)
+    rs.addFile(fname, arch=arch)
     rs.setArchitectureFor(name=fname, arch=arch)
     rs.loadGadgetsFor(name=fname)
     gadgets:str  = rs.getFileFor(name=fname).gadgets
