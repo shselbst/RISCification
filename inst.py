@@ -1,12 +1,19 @@
 from capstone import *
 import random
+from elftools.elf.elffile import ELFFile
 
 # returns list of objects containing info about an instruction
 def get_inst(fname: str, arch=CS_ARCH_X86, mode=CS_MODE_64):
-    binary = open(fname, 'rb').read()
+   
+    elf = ELFFile(open(fname, 'rb'))
 
-    md = Cs(CS_ARCH_X86, CS_MODE_64)
-    return list(md.disasm(binary, 0x0))
+    text_start = elf.get_section_by_name('.text')
+    text_code = text_start.data()
+    text_addr = text_start['sh_addr']
+    
+    
+    md = Cs(arch, mode)
+    return list(md.disasm(text_code, text_addr))
 
 def get_rand_inst_sample(fname: str, out_fname: str, num_inst=50):
     instructions = get_inst(fname)
