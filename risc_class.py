@@ -1,376 +1,472 @@
-from entropy import calculate_entropy
-from rop import get_num_gadgets
-from capstone import *
+from typing import List, Dict, Iterable, Optional, Tuple
 import random
+import os
+import logging
+
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from elftools.elf.elffile import ELFFile
-import sys
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
+
+# External functions assumed to exist (from your original codebase)
+from entropy import calculate_entropy
+from rop import get_num_gadgets
+
+# ------------------------
+# Module-level constants
+# ------------------------
+DEFAULT_ARCH = CS_ARCH_X86
+DEFAULT_MODE = CS_MODE_64
+DEFAULT_TEMP_FNAME = "tmp.bin"
+ENTROPY_PERCENT_SCALE = 100.0  # multiply per-instruction entropy fraction by 100 to get percent
+DEFAULT_PLOT_SIZE = (8, 6)
+ENTROPY_BIN_COUNT = 101  # produces bins for 0..100 in steps of 1
+TOP_TERMINATOR_COUNTS = 5
+
+# ------------------------
+# Logging configuration
+# ------------------------
+logger = logging.getLogger(__name__)
+
+
+def configure_logging(level: int = logging.INFO, fmt: str = None) -> None:
+    """
+    Configure basic logging for this module. Call once from your application entry point.
+    Example: configure_logging(logging.DEBUG)
+    """
+    if fmt is None:
+        fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(fmt))
+    root = logging.getLogger()
+    if not root.handlers:
+        root.addHandler(handler)
+    root.setLevel(level)
+
+
+# ------------------------
+# Helper utilities
+# ------------------------
+def read_text_section_from_elf(bin_path: str) -> Tuple[bytes, int]:
+    """
+    Read the .text section bytes and starting address from an ELF file.
+    Raises FileNotFoundError or ValueError if section not found.
+    """
+    with open(bin_path, "rb") as fh:
+        elf = ELFFile(fh)
+        text_section = elf.get_section_by_name(".text")
+        if text_section is None:
+            raise ValueError(f"No .text section found in {bin_path}")
+        return text_section.data(), text_section["sh_addr"]
+
+
+def get_jump_and_terminators() -> set:
+    """
+    Return a set of mnemonics considered ROP gadget terminators (jumps, call, ret).
+    Kept as a function to avoid repeating the list in multiple methods.
+    """
+    jumps = [
+        "jmp",
+        "je", "jz",
+        "jne", "jnz",
+        "js",
+        "jns",
+        "jo",
+        "jno",
+        "jc", "jb", "jnae",
+        "jnc", "jae", "jnb",
+        "jbe",
+        "ja",
+        "jl", "jnge",
+        "jge", "jnl",
+        "jle", "jng",
+        "jg", "jnle",
+        "jp", "jpe",
+        "jnp", "jpo",
+        "jmpf",
+        "jecxz",
+        "jrcxz"
+    ]
+    return set(jumps + ["call", "ret"])
+
+
+def save_bytes_to_file(data: bytes, out_fname: str) -> None:
+    """Write bytes to out_fname."""
+    with open(out_fname, "wb") as fh:
+        fh.write(data)
+
+
+def ensure_sample_size_ok(total_insts: int, requested: int) -> None:
+    """Raise ValueError if requested sample size is impossible."""
+    if requested <= 0:
+        raise ValueError("requested sample size must be > 0")
+    if requested > total_insts:
+        raise ValueError(f"requested {requested} > available instructions {total_insts}")
+
+
+# ------------------------
+# RiscClass (refactored)
+# ------------------------
 class RiscClass:
-    def __init__(self, bin_file_path):
+    """
+    Encapsulates functionality for sampling instructions from an ELF binary,
+    computing entropy/gadget metrics on the sampled bytes, and producing plots.
+    """
+
+    def __init__(self, bin_file_path: str, arch: int = DEFAULT_ARCH, mode: int = DEFAULT_MODE):
+        """
+        Initialize the object and disassemble the .text section using Capstone.
+        """
         self.bin_file_path = bin_file_path
-        self.instructions = self.get_inst()
+        self.arch = arch
+        self.mode = mode
 
+        # Disassemble and store instructions
+        logger.debug("Disassembling binary: %s", bin_file_path)
+        self.instructions = self._disassemble_text_section()
+        logger.info("Loaded %d instructions from %s", len(self.instructions), bin_file_path)
 
-    # returns list of objects containing info about an instruction
-    def get_inst(self, arch=CS_ARCH_X86, mode=CS_MODE_64):
-    
-        elf = ELFFile(open(self.bin_file_path, 'rb'))
+    # ------------------------
+    # Disassembly & sampling
+    # ------------------------
+    def _disassemble_text_section(self) -> List:
+        """
+        Disassemble the .text section and return a list of capstone instruction objects.
+        """
+        text_bytes, text_addr = read_text_section_from_elf(self.bin_file_path)
+        md = Cs(self.arch, self.mode)
+        return list(md.disasm(text_bytes, text_addr))
 
-        text_start = elf.get_section_by_name('.text')
-        text_code = text_start.data()
-        text_addr = text_start['sh_addr']
-        
-        
-        md = Cs(arch, mode)
-        return list(md.disasm(text_code, text_addr))
-
-    def get_rand_inst_sample(self, out_fname: str, num_inst=50):
+    def get_random_instruction_sample(self, num_inst: int, out_fname: str = DEFAULT_TEMP_FNAME) -> List:
+        """
+        Sample `num_inst` random (non-contiguous) instructions, write their bytes to out_fname,
+        and return the list of capstone instruction objects.
+        """
+        ensure_sample_size_ok(len(self.instructions), num_inst)
         inst_sample = random.sample(self.instructions, num_inst)
-        binary_sample = b''.join(ins.bytes for ins in inst_sample)
-        with open(out_fname, "wb") as f:
-            f.write(binary_sample)
+        save_bytes_to_file(b"".join(ins.bytes for ins in inst_sample), out_fname)
+        logger.debug("Wrote random sample of %d instructions to %s", num_inst, out_fname)
         return inst_sample
 
-    def get_contiguous_rand_inst(self, out_fname: str, num_inst: 50):
+    def get_contiguous_instruction_sample(self, num_inst: int, out_fname: str = DEFAULT_TEMP_FNAME) -> List:
+        """
+        Get a contiguous slice of `num_inst` instructions starting at a random index,
+        write their bytes to out_fname, and return the list of instruction objects.
+        """
+        ensure_sample_size_ok(len(self.instructions), num_inst)
         start_index = random.randint(0, len(self.instructions) - num_inst)
-        inst_sample = self.instructions[start_index:start_index+num_inst]
-        binary_sample = b''.join(ins.bytes for ins in inst_sample)
-        with open(out_fname, "wb") as f:
-            f.write(binary_sample)
+        inst_sample = self.instructions[start_index:start_index + num_inst]
+        save_bytes_to_file(b"".join(ins.bytes for ins in inst_sample), out_fname)
+        logger.debug("Wrote contiguous sample of %d instructions (start=%d) to %s", num_inst, start_index, out_fname)
         return inst_sample
 
-    def graph_entropy_cnt_vs_gadgets(self, num_repetitions: int, num_sample_insts: int, graph_fname: str) -> None:
-        temp_fname = "tmp.bin"
-        entropy_values = []
-        num_gadgets_values = []
+    # ------------------------
+    # Low-level sample metrics
+    # ------------------------
+    def _entropy_for_sample_file(self, sample_fname: str, per_instruction: bool = False, num_insts: Optional[int] = None) -> float:
+        """
+        Call external calculate_entropy on the sample file and optionally scale to per-instruction percent.
+        Assumes calculate_entropy returns a numeric entropy value (e.g., bits or sum).
+        If per_instruction True, then num_insts must be provided and the return is scaled to percent:
+            entropy_percent = (entropy_val / num_insts) * 100
+        """
+        if per_instruction and (num_insts is None or num_insts <= 0):
+            raise ValueError("num_insts must be provided and > 0 when per_instruction=True")
+        entropy_val = calculate_entropy(sample_fname)
+        logger.debug("Calculated entropy for %s: %s", sample_fname, entropy_val)
+        if per_instruction:
+            scaled = (entropy_val / num_insts) * ENTROPY_PERCENT_SCALE
+            logger.debug("Scaled entropy to percent (per-instruction): %s", scaled)
+            return scaled
+        return float(entropy_val)
 
-        for i in range(num_repetitions):
-            
-            self.get_rand_inst_sample(out_fname=temp_fname, num_inst=num_sample_insts)
-            entropy = calculate_entropy(temp_fname)
-            num_gadgets = get_num_gadgets(temp_fname)
-            print(f"Iteration {i + 1}...\nEntropy: {entropy}\n# Gadgets: {num_gadgets}\n")
+    def _count_gadget_terminators_in_sample(self, inst_sample: Iterable) -> int:
+        """
+        Count the number of instructions in inst_sample whose mnemonic is a gadget terminator.
+        Expects each inst to have a `mnemonic` attribute (capstone instruction).
+        """
+        terminators = get_jump_and_terminators()
+        count = sum(1 for inst in inst_sample if getattr(inst, "mnemonic", None) in terminators)
+        logger.debug("Counted %d gadget terminators in sample of %d instructions", count, len(list(inst_sample)))
+        return count
 
-            entropy_values.append(entropy)
-            num_gadgets_values.append(num_gadgets)
-
-        entropy_values = np.array(entropy_values)
-        num_gadgets_values = np.array(num_gadgets_values)
-
-        x2 = entropy_values ** 2
-        X = np.column_stack((entropy_values, x2))
+    # ------------------------
+    # Plotting helpers
+    # ------------------------
+    @staticmethod
+    def _fit_quadratic_regression(x: np.ndarray, y: np.ndarray):
+        """
+        Fit a quadratic (y ~ 1 + x + x^2) OLS model using statsmodels and return the fitted model.
+        """
+        x2 = x ** 2
+        X = np.column_stack((x, x2))
         X = sm.add_constant(X)
+        model = sm.OLS(y, X).fit()
+        return model
 
-        model = sm.OLS(num_gadgets_values, X).fit()
-
-        print("SUMMARY:", model.summary())
-
-
-        # Create dot plot
-        plt.figure(figsize=(8, 6))
-        plt.plot(entropy_values, num_gadgets_values, 'o', markersize=6)
-        plt.title('Number of Gadgets vs Entropy')
-        plt.xlabel('Entropy')
-        plt.ylabel('Number of Gadgets')
+    @staticmethod
+    def _save_scatter_plot(x: Iterable, y: Iterable, title: str, xlabel: str, ylabel: str, out_fname: str, figsize: Tuple = DEFAULT_PLOT_SIZE):
+        """Create and save a simple scatter plot."""
+        plt.figure(figsize=figsize)
+        plt.plot(x, y, "o", markersize=6)
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
         plt.grid(True)
-        plt.savefig(graph_fname)  # Save plot to file
-        print(f"Plot saved as {graph_fname}")
+        plt.tight_layout()
+        plt.savefig(out_fname)
+        plt.close()
 
-    def graph_entropy_prcnt_vs_gadgets(self, num_repetitions: int, num_sample_insts: int, graph_fname: str) -> None:
-        temp_fname = "tmp.bin"
+    # ------------------------
+    # Public plotting methods
+    # ------------------------
+    def graph_entropy_cnt_vs_gadgets(self, num_repetitions: int, num_sample_insts: int, graph_fname: str,
+                                    sample_type: str = "random", temp_fname: str = DEFAULT_TEMP_FNAME) -> None:
+        """
+        Perform `num_repetitions` samples and plot Number of Gadgets vs Entropy.
+        sample_type: "random" (non-contiguous) or "contiguous"
+        """
+        entropy_values = []
+        num_gadgets_values = []
+
+        sampler = self.get_random_instruction_sample if sample_type == "random" else self.get_contiguous_instruction_sample
+
+        for i in range(num_repetitions):
+            sampler(num_inst=num_sample_insts, out_fname=temp_fname)
+            entropy = self._entropy_for_sample_file(temp_fname, per_instruction=False)
+            num_gadgets = get_num_gadgets(temp_fname)
+            logger.info("Iteration %d: Entropy=%s, #Gadgets=%s", i + 1, entropy, num_gadgets)
+            entropy_values.append(entropy)
+            num_gadgets_values.append(num_gadgets)
+
+        x = np.array(entropy_values)
+        y = np.array(num_gadgets_values)
+        model = self._fit_quadratic_regression(x, y)
+        logger.info("Regression SUMMARY:\n%s", model.summary())
+
+        self._save_scatter_plot(x, y, "Number of Gadgets vs Entropy", "Entropy", "Number of Gadgets", graph_fname)
+        logger.info("Plot saved as %s", graph_fname)
+
+    def graph_entropy_prcnt_vs_gadgets(self, num_repetitions: int, num_sample_insts: int, graph_fname: str,
+                                      temp_fname: str = DEFAULT_TEMP_FNAME) -> None:
+        """
+        Similar to graph_entropy_cnt_vs_gadgets but entropy is scaled per-instruction into percent.
+        """
         entropy_values = []
         num_gadgets_values = []
 
         for i in range(num_repetitions):
-            
-            self.get_rand_inst_sample(out_fname=temp_fname, num_inst=num_sample_insts)
-            entropy = calculate_entropy(temp_fname) / num_sample_insts
+            self.get_random_instruction_sample(num_inst=num_sample_insts, out_fname=temp_fname)
+            entropy_prcnt = self._entropy_for_sample_file(temp_fname, per_instruction=True, num_insts=num_sample_insts)
             num_gadgets = get_num_gadgets(temp_fname)
-            #print(f"Iteration {i + 1}...\nEntropy: {entropy}\n# Gadgets: {num_gadgets}\n")
-
-            entropy_values.append(entropy)
+            logger.debug("Iteration %d: Entropy(%%)=%s, #Gadgets=%s", i + 1, entropy_prcnt, num_gadgets)
+            entropy_values.append(entropy_prcnt)
             num_gadgets_values.append(num_gadgets)
 
-        entropy_values = np.array(entropy_values)
-        num_gadgets_values = np.array(num_gadgets_values)
+        x = np.array(entropy_values)
+        y = np.array(num_gadgets_values)
+        model = self._fit_quadratic_regression(x, y)
+        logger.info("Regression SUMMARY:\n%s", model.summary())
 
-        x2 = entropy_values ** 2
-        X = np.column_stack((entropy_values, x2))
-        X = sm.add_constant(X)
+        self._save_scatter_plot(x, y, "Number of Gadgets vs Entropy %", "Entropy (%)", "Number of Gadgets", graph_fname)
+        logger.info("Plot saved as %s", graph_fname)
 
-        model = sm.OLS(num_gadgets_values, X).fit()
-
-        print("SUMMARY:", model.summary())
-
-
-        # Create dot plot
-        plt.figure(figsize=(8, 6))
-        plt.plot(entropy_values, num_gadgets_values, 'o', markersize=6)
-        plt.title('Number of Gadgets vs Entropy %')
-        plt.xlabel('Entropy')
-        plt.ylabel('Number of Gadgets')
-        plt.grid(True)
-        plt.savefig(graph_fname)  # Save plot to file
-        print(f"Plot saved as {graph_fname}")
-
-    def graph_entropy_prcnt_vs_avg_gadgets(self, num_repetitions: int, num_sample_insts: int, graph_fname: str) -> None:
-        temp_fname = "tmp.bin"
+    def graph_entropy_prcnt_vs_avg_gadgets(self, num_repetitions: int, num_sample_insts: int, graph_fname: str,
+                                           temp_fname: str = DEFAULT_TEMP_FNAME) -> None:
+        """
+        Create a binned line plot of average number of gadgets vs entropy percent.
+        """
         entropy_values = []
         num_gadgets_values = []
 
         for i in range(num_repetitions):
-            self.get_rand_inst_sample(out_fname=temp_fname, num_inst=num_sample_insts)
-            entropy = calculate_entropy(temp_fname) / num_sample_insts
+            self.get_random_instruction_sample(num_inst=num_sample_insts, out_fname=temp_fname)
+            entropy_prcnt = self._entropy_for_sample_file(temp_fname, per_instruction=True, num_insts=num_sample_insts)
             num_gadgets = get_num_gadgets(temp_fname)
-            #print(f"Iteration {i + 1}...\nEntropy: {entropy}\n# Gadgets: {num_gadgets}\n")
-            entropy_values.append(entropy)
+            logger.debug("Iteration %d: Entropy(%%)=%s, #Gadgets=%s", i + 1, entropy_prcnt, num_gadgets)
+            entropy_values.append(entropy_prcnt)
             num_gadgets_values.append(num_gadgets)
 
-        # Convert to numpy arrays
-        entropy_values = np.array(entropy_values)
-        num_gadgets_values = np.array(num_gadgets_values)
-
-        # Convert entropy to percentage (0 to 100)
-        entropy_percent = entropy_values * 100
-
-        # Define bins for entropy percentage, e.g., each 1%
-        bins = np.linspace(0, 100, num=101)  # edges for 0%,1%,2%,...,100%
-        
-        # Use pandas to bin and group
         df = pd.DataFrame({
-            'entropy_prcnt': entropy_percent,
-            'num_gadgets': num_gadgets_values
+            "entropy_prcnt": np.array(entropy_values) * 1.0,  # percent already
+            "num_gadgets": np.array(num_gadgets_values)
         })
 
-        # Bin entropy percentages into intervals
-        df['entropy_bin'] = pd.cut(df['entropy_prcnt'], bins=bins, right=False)
+        bins = np.linspace(0, ENTROPY_PERCENT_SCALE, ENTROPY_BIN_COUNT)
+        df["entropy_bin"] = pd.cut(df["entropy_prcnt"], bins=bins, right=False)
+        grouped = df.groupby("entropy_bin")["num_gadgets"].mean().reset_index().dropna()
 
-        # Group by bins and compute average number of gadgets per bin
-        grouped = df.groupby('entropy_bin')['num_gadgets'].mean().reset_index()
+        # compute bin midpoints for plotting
+        grouped["bin_mid"] = grouped["entropy_bin"].apply(lambda b: (b.left + b.right) / 2)
 
-        # For x-axis, use the bin midpoint (or left edge)
-        def bin_midpoint(bin_interval):
-            return (bin_interval.left + bin_interval.right) / 2
-
-        grouped['bin_mid'] = grouped['entropy_bin'].apply(bin_midpoint)
-
-        # Remove bins with no data (nan avg)
-        grouped = grouped.dropna()
-
-        # Plotting averages per entropy %
         plt.figure(figsize=(10, 6))
-        plt.plot(grouped['bin_mid'], grouped['num_gadgets'], marker='o', linestyle='-', color='b')
-        plt.title('Average Number of ROP Gadgets vs. Entropy Percentage')
-        plt.xlabel('Entropy Percentage (%)')
-        plt.ylabel('Average Number of Gadgets')
+        plt.plot(grouped["bin_mid"], grouped["num_gadgets"], marker="o", linestyle="-", color="b")
+        plt.title("Average Number of ROP Gadgets vs. Entropy Percentage")
+        plt.xlabel("Entropy Percentage (%)")
+        plt.ylabel("Average Number of Gadgets")
         plt.grid(True)
         plt.xlim(0, 100)
         plt.tight_layout()
         plt.savefig(graph_fname)
-        print(f"Plot saved as {graph_fname}")
+        plt.close()
+        logger.info("Plot saved: %s", graph_fname)
 
-    def graph_entropy_prcnt_vs_gadget_terminators_prcnt(self, num_repetitions: int, num_sample_insts: int, graph_fname: str) -> None:
-        temp_fname = "tmp.bin"
-        jumps = [
-            "jmp",
-            "je", "jz",
-            "jne", "jnz",
-            "js",
-            "jns",
-            "jo",
-            "jno",
-            "jc", "jb", "jnae",
-            "jnc", "jae", "jnb",
-            "jbe",
-            "ja",
-            "jl", "jnge",
-            "jge", "jnl",
-            "jle", "jng",
-            "jg", "jnle",
-            "jp", "jpe",
-            "jnp", "jpo",
-            "jmpf",
-            "jecxz",
-            "jrcxz"
-        ]
-        gadget_terminators = set(jumps + ["call", "ret"])
-
+    def graph_entropy_prcnt_vs_gadget_terminators_prcnt(self, num_repetitions: int, num_sample_insts: int, graph_fname: str,
+                                                       temp_fname: str = DEFAULT_TEMP_FNAME) -> None:
+        """
+        For many samples, compute entropy percent and the percent of instructions that are gadget terminators,
+        then plot average terminator percentage binned by entropy percent.
+        """
         entropy_percentages = []
         gadget_terminators_prcnts = []
+        terminators = get_jump_and_terminators()
 
         for i in range(num_repetitions):
-            # Generate random instruction sample first (populates temp_fname)
-            inst_sample = self.get_rand_inst_sample(out_fname=temp_fname, num_inst=num_sample_insts)
-
-            # Compute entropy AFTER sample is saved to temp file
-            entropy_val = calculate_entropy(temp_fname)  # assuming this returns float entropy (e.g. bits or percent)
-
-            # If entropy_val is like bytes entropy (0-8): scale to percent of max entropy 8 bits
-            entropy_percent = (entropy_val / num_sample_insts) * 100
-
-            prcnt_terminators = (sum(1 for inst in inst_sample if inst.mnemonic in gadget_terminators) / len(inst_sample)) * 100
-
+            inst_sample = self.get_random_instruction_sample(num_inst=num_sample_insts, out_fname=temp_fname)
+            entropy_val = calculate_entropy(temp_fname)
+            entropy_percent = (entropy_val / num_sample_insts) * ENTROPY_PERCENT_SCALE
+            prcnt_terminators = (self._count_gadget_terminators_in_sample(inst_sample) / len(inst_sample)) * ENTROPY_PERCENT_SCALE
+            logger.debug("Iteration %d: Entropy(%%)=%s, Terminators(%%)=%s", i + 1, entropy_percent, prcnt_terminators)
             entropy_percentages.append(entropy_percent)
             gadget_terminators_prcnts.append(prcnt_terminators)
 
         df = pd.DataFrame({
-            'entropy_percent': entropy_percentages,
-            'prcnt_terminators': gadget_terminators_prcnts
+            "entropy_percent": entropy_percentages,
+            "prcnt_terminators": gadget_terminators_prcnts
         })
 
-        # Bin entropy into intervals (e.g., 1% steps), then average gadget terminators per bin:
-        bins = np.linspace(0, 100, 101)
-        df['entropy_bin'] = pd.cut(df['entropy_percent'], bins=bins, right=False)
+        bins = np.linspace(0, ENTROPY_PERCENT_SCALE, ENTROPY_BIN_COUNT)
+        df["entropy_bin"] = pd.cut(df["entropy_percent"], bins=bins, right=False)
+        grouped = df.groupby("entropy_bin")["prcnt_terminators"].mean().reset_index().dropna()
+        grouped["bin_mid"] = grouped["entropy_bin"].apply(lambda b: (b.left + b.right) / 2)
 
-        grouped = df.groupby('entropy_bin')['prcnt_terminators'].mean().reset_index()
-
-        # Calculate bin midpoints for x-axis plotting
-        grouped['bin_mid'] = grouped['entropy_bin'].apply(lambda x: (x.left + x.right) / 2)
-
-        # Drop NaNs (bins with no samples)
-        grouped = grouped.dropna(subset=['prcnt_terminators'])
-
-        # Plot
-        plt.figure(figsize=(8, 6))
-        plt.plot(grouped['bin_mid'], grouped['prcnt_terminators'], 'o-', markersize=6)
-        plt.title('Average Gadget Terminators % vs Entropy Percentage')
-        plt.xlabel('Entropy (%)')
-        plt.ylabel('Average Gadget Terminators (%)')
+        plt.figure(figsize=DEFAULT_PLOT_SIZE)
+        plt.plot(grouped["bin_mid"], grouped["prcnt_terminators"], "o-", markersize=6)
+        plt.title("Average Gadget Terminators % vs Entropy Percentage")
+        plt.xlabel("Entropy (%)")
+        plt.ylabel("Average Gadget Terminators (%)")
         plt.grid(True)
         plt.tight_layout()
         plt.savefig(graph_fname)
         plt.close()
-        print(f"Plot saved as {graph_fname}")
-    
+        logger.info("Plot saved: %s", graph_fname)
+
     def graph_gadgets_vs_entropy_multi_line(
         self,
         required_qualifying_samples: int,
         num_sample_insts: int,
         min_terminators_required: int,
         graph_fname: str,
-        terminator_counts_to_plot: list = None,
-        max_trials: int = 10000
-        ) -> None:
+        terminator_counts_to_plot: Optional[List[int]] = None,
+        max_trials: int = 10000,
+        temp_fname: str = DEFAULT_TEMP_FNAME
+    ) -> None:
         """
-        Collect random instruction samples until we have `required_qualifying_samples`
-        samples that contain at least `min_terminators_required` gadget terminators.
-        Then produce a single multi-line plot where each line shows the average number
-        of gadgets vs entropy percentage for a given terminator count.
-
-        Parameters:
-        - required_qualifying_samples: number of qualifying samples to collect
-          (samples that have >= min_terminators_required terminators).
-        - num_sample_insts: how many instructions per sample (passed to get_rand_inst_sample).
-        - min_terminators_required: minimum terminators in a sample to count it toward the collection.
-        - graph_fname: filename (with extension, e.g., .png) to save the combined plot.
-        - terminator_counts_to_plot: optional list of specific terminator counts to include.
-          If None, the method plots all observed terminator counts >= min_terminators_required.
-        - max_trials: upper bound on attempts to avoid infinite loops; raise RuntimeError if exceeded.
+        Collect qualifying samples (samples that have >= min_terminators_required termination instructions)
+        until required_qualifying_samples are collected or max_trials exceeded. Then produce a multi-line
+        plot: each line corresponds to an observed terminator count and shows average number of gadgets per entropy bin.
         """
-        temp_fname = "tmp.bin"
-        jumps = [
-            "jmp",
-            "je", "jz",
-            "jne", "jnz",
-            "js",
-            "jns",
-            "jo",
-            "jno",
-            "jc", "jb", "jnae",
-            "jnc", "jae", "jnb",
-            "jbe",
-            "ja",
-            "jl", "jnge",
-            "jge", "jnl",
-            "jle", "jng",
-            "jg", "jnle",
-            "jp", "jpe",
-            "jnp", "jpo",
-            "jmpf",
-            "jecxz",
-            "jrcxz"
-        ]
-        gadget_terminators = set(jumps + ["call", "ret"])
-
-        qualifying_samples = []
+        terminators = get_jump_and_terminators()
+        qualifying_samples: List[Dict] = []
         trials = 0
+
         while len(qualifying_samples) < required_qualifying_samples and trials < max_trials:
             trials += 1
-            inst_sample = self.get_rand_inst_sample(out_fname=temp_fname, num_inst=num_sample_insts)
-            entropy_val = calculate_entropy(temp_fname)
-            # Scale entropy to per-instruction percent (consistent with your other methods)
-            entropy_percent = (entropy_val / num_sample_insts) * 100
-            term_count = sum(1 for inst in inst_sample if inst.mnemonic in gadget_terminators)
+            inst_sample = self.get_random_instruction_sample(num_inst=num_sample_insts, out_fname=temp_fname)
+            term_count = self._count_gadget_terminators_in_sample(inst_sample)
             if term_count < min_terminators_required:
+                logger.debug("Trial %d: term_count=%d < min_required=%d -> skipping", trials, term_count, min_terminators_required)
                 continue
+            entropy_percent = self._entropy_for_sample_file(temp_fname, per_instruction=True, num_insts=num_sample_insts)
             num_gadgets = get_num_gadgets(temp_fname)
             qualifying_samples.append({
-                'entropy_percent': entropy_percent,
-                'num_gadgets': num_gadgets,
-                'terminator_count': term_count
+                "entropy_percent": entropy_percent,
+                "num_gadgets": num_gadgets,
+                "terminator_count": term_count
             })
+            logger.info("Collected qualifying sample %d/%d (trial=%d): terminators=%d, entropy(%%)=%s, gadgets=%s",
+                        len(qualifying_samples), required_qualifying_samples, trials, term_count, entropy_percent, num_gadgets)
 
-        if trials >= max_trials and len(qualifying_samples) < required_qualifying_samples:
+        if len(qualifying_samples) < required_qualifying_samples:
+            logger.error(
+                "Failed to collect required samples: collected %d of %d within %d trials",
+                len(qualifying_samples), required_qualifying_samples, max_trials
+            )
             raise RuntimeError(
-                f"Exceeded max_trials ({max_trials}) before collecting required qualifying samples "
-                f"({required_qualifying_samples}). Collected {len(qualifying_samples)}."
+                f"Failed to collect required samples: collected {len(qualifying_samples)} "
+                f"of {required_qualifying_samples} within {max_trials} trials"
             )
 
         df = pd.DataFrame(qualifying_samples)
+        observed_counts = sorted(df["terminator_count"].unique().tolist())
 
-        # decide which terminator counts to plot
-        observed_counts = sorted(df['terminator_count'].unique().tolist())
+        # select top N terminator counts by number of samples (datapoints)
+        counts_series = df["terminator_count"].value_counts()  # sorted descending
+
         if terminator_counts_to_plot is None:
-            terminator_counts = [c for c in observed_counts if c >= min_terminators_required]
+            # choose the top TOP_TERMINATOR_COUNTS most-common terminator counts observed
+            terminator_counts = counts_series.index.tolist()[:TOP_TERMINATOR_COUNTS]
         else:
-            # keep only those requested that were actually observed
-            terminator_counts = [c for c in sorted(set(terminator_counts_to_plot)) if c in observed_counts]
+            # respect user-requested counts but only keep those that were actually observed,
+            # ordered by observed frequency (most common first)
+            requested = set(terminator_counts_to_plot)
+            terminator_counts = [c for c in counts_series.index.tolist() if c in requested][:TOP_TERMINATOR_COUNTS]
 
         if not terminator_counts:
-            print("No terminator counts to plot (none observed or none match requested).")
+            logger.warning("No terminator counts available to plot; returning.")
             return
 
+        # log which terminator counts will be plotted and their datapoint counts
+        logger.info(
+            "Plotting up to top %d terminator counts by datapoints: %s",
+            TOP_TERMINATOR_COUNTS,
+            ", ".join(f"{c}({counts_series[c]})" for c in terminator_counts)
+        )
+
         # bin settings
-        bins = np.linspace(0, 100, 101)  # 0..100 percent in 1% steps
-
+        bins = np.linspace(0, ENTROPY_PERCENT_SCALE, ENTROPY_BIN_COUNT)  # 0..100 in 1% steps
         plt.figure(figsize=(10, 7))
-
-        # Choose a color cycle so lines are distinct
-        prop_cycle = plt.rcParams['axes.prop_cycle']
-        colors = prop_cycle.by_key().get('color', None)
+        prop_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", None)
+        colors = prop_cycle if prop_cycle is not None else []
 
         for idx, tc in enumerate(terminator_counts):
-            sub = df[df['terminator_count'] == tc].copy()
+            sub = df[df["terminator_count"] == tc].copy()
             if sub.empty:
-                print(f"No samples for terminator count {tc}, skipping.")
+                logger.debug("No samples for terminator count %d, skipping", tc)
                 continue
-            sub['entropy_bin'] = pd.cut(sub['entropy_percent'], bins=bins, right=False)
-            grouped = sub.groupby('entropy_bin')['num_gadgets'].mean().reset_index()
-
-            # compute bin midpoints for x-axis
-            def bin_midpoint(bin_interval):
-                return (bin_interval.left + bin_interval.right) / 2
-            grouped['bin_mid'] = grouped['entropy_bin'].apply(bin_midpoint)
-            grouped = grouped.dropna(subset=['num_gadgets'])
+            sub["entropy_bin"] = pd.cut(sub["entropy_percent"], bins=bins, right=False)
+            grouped = sub.groupby("entropy_bin")["num_gadgets"].mean().reset_index().dropna()
             if grouped.empty:
-                print(f"After binning, no non-empty bins for terminator count {tc}, skipping.")
+                logger.debug("After binning, no non-empty bins for terminator count %d, skipping", tc)
                 continue
+            # compute bin midpoints for x-axis
+            grouped["bin_mid"] = grouped["entropy_bin"].apply(lambda b: (b.left + b.right) / 2)
+            x = grouped["bin_mid"].values
+            y = grouped["num_gadgets"].values
+            color = colors[idx % len(colors)] if colors else None
 
-            color = None
-            if colors:
-                color = colors[idx % len(colors)]
-            plt.plot(grouped['bin_mid'], grouped['num_gadgets'],
-                     marker='o', linestyle='-', label=f"Terminators = {tc}", color=color)
+            # plot the binned averages
+            plt.plot(x, y, marker="o", linestyle="-", label=f"Terminators = {tc}", color=color)
 
-        plt.title('Average Number of ROP Gadgets vs Entropy Percentage\n(Separate lines per terminator count)')
-        plt.xlabel('Entropy Percentage (%)')
-        plt.ylabel('Average Number of Gadgets')
+            # add a linear trend line (degree=1). Only add if we have at least 2 points.
+            if len(x) >= 2:
+                # Fit a 1st-degree polynomial (linear)
+                coeffs = np.polyfit(x, y, deg=1)
+                trend_y = np.polyval(coeffs, x)
+                # plot trend as dashed line with same color (or slightly darker)
+                plt.plot(x, trend_y, linestyle="--", color=color, alpha=0.8)
+
+            logger.debug("Plotted terminator count %d (%d bins)", tc, len(grouped))
+
+        plt.title("Average Number of ROP Gadgets vs Entropy Percentage\n(Separate lines per terminator count)")
+        plt.xlabel("Entropy Percentage (%)")
+        plt.ylabel("Average Number of Gadgets")
         plt.grid(True)
-        plt.legend(title='Terminator Count', loc='best', fontsize='small')
+        plt.legend(title="Terminator Count", loc="best", fontsize="small")
         plt.tight_layout()
         plt.savefig(graph_fname)
         plt.close()
-        print(f"Combined plot saved as {graph_fname}")
+        logger.info("Combined plot saved: %s", graph_fname)
