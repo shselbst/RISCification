@@ -81,3 +81,5 @@ def get_gadgets_from_list(fname: str,
     # Use debug logging to avoid noisy output in normal runs; callers can set DEBUG level to see gadgets.
     logger.debug("Gadgets for %s: %s", fname, gadgets)
     return gadgets
+
+configure_logging(logging.INFO)

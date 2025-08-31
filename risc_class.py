@@ -470,3 +470,6 @@ class RiscClass:
         plt.savefig(graph_fname)
         plt.close()
         logger.info("Combined plot saved: %s", graph_fname)
+
+
+configure_logging(logging.INFO)
