@@ -15,15 +15,14 @@ def main():
     num_repetitions = int(sys.argv[2])
     num_sample_instructions = int(sys.argv[3])
 
-    risc.graph_entropy_cnt_vs_gadgets(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_cnt_vs_g_cnt.png")
-    risc.graph_entropy_prcnt_vs_avg_gadgets(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_prcnt_vs_g_avg.png")
-    risc.graph_entropy_prcnt_vs_gadgets(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_prcnt_vs_g_cnt.png")
-    risc.graph_entropy_prcnt_vs_gadget_terminators_prcnt(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_prcnt_vs_g_term_prcnt.png")
+    # risc.graph_entropy_cnt_vs_gadgets(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_cnt_vs_g_cnt.png")
+    # risc.graph_entropy_prcnt_vs_avg_gadgets(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_prcnt_vs_g_avg.png")
+    # risc.graph_entropy_prcnt_vs_gadgets(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_prcnt_vs_g_cnt.png")
+    # risc.graph_entropy_prcnt_vs_gadget_terminators_prcnt(num_repetitions=num_repetitions, num_sample_insts=num_sample_instructions, graph_fname="e_prcnt_vs_g_term_prcnt.png")
     risc.graph_gadgets_vs_entropy_multi_line(
-        # TODO: Make req qualifying samples and min_terminators_required tunables
-        required_qualifying_samples=num_sample_instructions,
+        data_points_per_count=500,
+        top_terminator_counts=15,
         num_sample_insts=num_sample_instructions,
-        min_terminators_required=10,
         graph_fname="gadgets_vs_entropy_multiline.png"
     )
 

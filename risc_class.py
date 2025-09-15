@@ -1,17 +1,22 @@
-from typing import List, Dict, Iterable, Optional, Tuple
-import random
-import os
-import logging
 
+
+from typing import List, Dict, Iterable, Optional, Tuple
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from elftools.elf.elffile import ELFFile
+from scipy.stats import linregress
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-# External functions assumed to exist (from your original codebase)
+import pandas as pd
+import numpy as np
+import random
+import os
+import logging
+
 from entropy import calculate_entropy
 from rop import get_num_gadgets
 
@@ -105,6 +110,21 @@ def ensure_sample_size_ok(total_insts: int, requested: int) -> None:
         raise ValueError("requested sample size must be > 0")
     if requested > total_insts:
         raise ValueError(f"requested {requested} > available instructions {total_insts}")
+
+def _bootstrap_confidence_interval(x, y, degree=1, n_bootstrap=1000, alpha=0.05):
+    """Compute bootstrap confidence intervals for polynomial regression predictions."""
+    x_range = np.linspace(x.min(), x.max(), 200)
+    preds = []
+    for _ in range(n_bootstrap):
+        sample_idx = np.random.choice(len(x), len(x), replace=True)
+        x_sample, y_sample = x[sample_idx], y[sample_idx]
+        coeffs = np.polyfit(x_sample, y_sample, deg=degree)
+        poly = np.poly1d(coeffs)
+        preds.append(poly(x_range))
+    preds = np.array(preds)
+    lower = np.percentile(preds, 100 * alpha / 2, axis=0)
+    upper = np.percentile(preds, 100 * (1 - alpha / 2), axis=0)
+    return x_range, lower, upper
 
 
 # ------------------------
@@ -354,122 +374,209 @@ class RiscClass:
         plt.close()
         logger.info("Plot saved: %s", graph_fname)
 
-    def graph_gadgets_vs_entropy_multi_line(
+
+    def analyze_gadgets_vs_entropy(
         self,
-        required_qualifying_samples: int,
+        data_points_per_count: int,
         num_sample_insts: int,
-        min_terminators_required: int,
-        graph_fname: str,
+        top_terminator_counts: int,
         terminator_counts_to_plot: Optional[List[int]] = None,
-        max_trials: int = 10000,
+        max_trials: int = 10000000,
         temp_fname: str = DEFAULT_TEMP_FNAME
-    ) -> None:
+    ) -> (pd.DataFrame, pd.DataFrame, List[int]):
         """
-        Collect qualifying samples (samples that have >= min_terminators_required termination instructions)
-        until required_qualifying_samples are collected or max_trials exceeded. Then produce a multi-line
-        plot: each line corresponds to an observed terminator count and shows average number of gadgets per entropy bin.
+        Collects random instruction samples, computes full statistics, and returns
+        both raw data and summary stats.
         """
-        terminators = get_jump_and_terminators()
         qualifying_samples: List[Dict] = []
         trials = 0
 
-        while len(qualifying_samples) < required_qualifying_samples and trials < max_trials:
+        logger.info("Starting data collection...")
+        while trials < max_trials:
             trials += 1
-            inst_sample = self.get_random_instruction_sample(num_inst=num_sample_insts, out_fname=temp_fname)
+            inst_sample = self.get_random_instruction_sample(
+                num_inst=num_sample_insts, out_fname=temp_fname
+            )
             term_count = self._count_gadget_terminators_in_sample(inst_sample)
-            if term_count < min_terminators_required:
-                logger.debug("Trial %d: term_count=%d < min_required=%d -> skipping", trials, term_count, min_terminators_required)
+            if term_count < 1:
                 continue
-            entropy_percent = self._entropy_for_sample_file(temp_fname, per_instruction=True, num_insts=num_sample_insts)
+
+            entropy_percent = self._entropy_for_sample_file(
+                temp_fname, per_instruction=True, num_insts=num_sample_insts
+            )
             num_gadgets = get_num_gadgets(temp_fname)
+
             qualifying_samples.append({
                 "entropy_percent": entropy_percent,
                 "num_gadgets": num_gadgets,
                 "terminator_count": term_count
             })
-            logger.info("Collected qualifying sample %d/%d (trial=%d): terminators=%d, entropy(%%)=%s, gadgets=%s",
-                        len(qualifying_samples), required_qualifying_samples, trials, term_count, entropy_percent, num_gadgets)
 
-        if len(qualifying_samples) < required_qualifying_samples:
-            logger.error(
-                "Failed to collect required samples: collected %d of %d within %d trials",
-                len(qualifying_samples), required_qualifying_samples, max_trials
+            logger.info("Entropy %: " + str(entropy_percent) + " | # Gadgets: " + str(num_gadgets) )
+
+            if trials % 100 == 0:
+                logger.debug(f"Trials so far: {trials}, collected: {len(qualifying_samples)} samples")
+
+            df = pd.DataFrame(qualifying_samples)
+            counts_series = df["terminator_count"].value_counts()
+
+            if terminator_counts_to_plot is None:
+                target_counts = counts_series.index.tolist()[:top_terminator_counts]
+            else:
+                requested = set(terminator_counts_to_plot)
+                target_counts = [
+                    c for c in counts_series.index.tolist() if c in requested
+                ][:top_terminator_counts]
+
+            enough_data = all(
+                counts_series.get(tc, 0) >= data_points_per_count for tc in target_counts
             )
+            if enough_data:
+                logger.info("Collected enough data for all target terminator counts.")
+                break
+
+        if not enough_data:
             raise RuntimeError(
-                f"Failed to collect required samples: collected {len(qualifying_samples)} "
-                f"of {required_qualifying_samples} within {max_trials} trials"
+                f"Failed to collect {data_points_per_count} samples for each of "
+                f"the top {top_terminator_counts} terminator counts."
             )
 
         df = pd.DataFrame(qualifying_samples)
-        observed_counts = sorted(df["terminator_count"].unique().tolist())
 
-        # select top N terminator counts by number of samples (datapoints)
-        counts_series = df["terminator_count"].value_counts()  # sorted descending
+        logger.info("Performing statistical analysis...")
+        all_results = []
+        for tc in target_counts:
+            sub = df[df["terminator_count"] == tc]
+            slope, intercept, r, p, se = linregress(sub["entropy_percent"], sub["num_gadgets"])
+            res = {
+                "terminator_count": tc,
+                "n": len(sub),
+                "slope": slope,
+                "intercept": intercept,
+                "r_squared": r ** 2,
+                "p_value": p,
+                "std_err": se,
+                "mean_entropy": sub["entropy_percent"].mean(),
+                "mean_gadgets": sub["num_gadgets"].mean(),
+            }
+            all_results.append(res)
+            logger.info(
+                f"Terminator={tc}: n={res['n']}, slope={res['slope']:.3f}, "
+                f"R²={res['r_squared']:.3f}, p={res['p_value']:.3g}"
+            )
 
-        if terminator_counts_to_plot is None:
-            # choose the top TOP_TERMINATOR_COUNTS most-common terminator counts observed
-            terminator_counts = counts_series.index.tolist()[:TOP_TERMINATOR_COUNTS]
-        else:
-            # respect user-requested counts but only keep those that were actually observed,
-            # ordered by observed frequency (most common first)
-            requested = set(terminator_counts_to_plot)
-            terminator_counts = [c for c in counts_series.index.tolist() if c in requested][:TOP_TERMINATOR_COUNTS]
-
-        if not terminator_counts:
-            logger.warning("No terminator counts available to plot; returning.")
-            return
-
-        # log which terminator counts will be plotted and their datapoint counts
+        slope, intercept, r, p, se = linregress(df["entropy_percent"], df["num_gadgets"])
         logger.info(
-            "Plotting up to top %d terminator counts by datapoints: %s",
-            TOP_TERMINATOR_COUNTS,
-            ", ".join(f"{c}({counts_series[c]})" for c in terminator_counts)
+            f"Overall Trend: slope={slope:.3f}, intercept={intercept:.3f}, "
+            f"R²={r**2:.3f}, p={p:.3g}"
         )
 
-        # bin settings
-        bins = np.linspace(0, ENTROPY_PERCENT_SCALE, ENTROPY_BIN_COUNT)  # 0..100 in 1% steps
-        plt.figure(figsize=(10, 7))
-        prop_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", None)
-        colors = prop_cycle if prop_cycle is not None else []
+        stats_df = pd.DataFrame(all_results)
+        return df, stats_df, target_counts
 
-        for idx, tc in enumerate(terminator_counts):
-            sub = df[df["terminator_count"] == tc].copy()
-            if sub.empty:
-                logger.debug("No samples for terminator count %d, skipping", tc)
+
+    def plot_gadgets_vs_entropy(
+        self,
+        df: pd.DataFrame,
+        stats_df: pd.DataFrame,
+        graph_fname: str,
+        regression_degree: int = 1,
+        show_points: bool = True,
+        top_n: int = 5
+    ) -> None:
+        """
+        Plot regression lines ONLY for the top N terminator counts by number of points.
+
+        Args:
+            df: Raw data DataFrame
+            stats_df: Statistics DataFrame
+            graph_fname: Output filename
+            regression_degree: Degree of polynomial regression
+            show_points: Whether to plot scatter points
+            top_n: How many top terminator counts to include
+        """
+        plt.figure(figsize=(12, 8))
+        sns.set_context("talk")
+
+        # Determine top N terminator counts
+        counts = df["terminator_count"].value_counts()
+        top_counts = counts.index[:top_n]
+        df = df[df["terminator_count"].isin(top_counts)]
+        logger.info(f"Plotting top {top_n} terminator counts: {list(top_counts)}")
+
+        colors = sns.color_palette("tab10", n_colors=len(top_counts))
+
+        # Optional scatter points
+        if show_points:
+            sns.scatterplot(
+                data=df,
+                x="entropy_percent",
+                y="num_gadgets",
+                hue="terminator_count",
+                alpha=0.5,
+                palette=colors,
+                edgecolor=None
+            )
+
+        # Trend lines for top N only
+        for idx, tc in enumerate(sorted(top_counts)):
+            sub = df[df["terminator_count"] == tc]
+            x, y = sub["entropy_percent"].values, sub["num_gadgets"].values
+            if len(x) < regression_degree + 1:
                 continue
-            sub["entropy_bin"] = pd.cut(sub["entropy_percent"], bins=bins, right=False)
-            grouped = sub.groupby("entropy_bin")["num_gadgets"].mean().reset_index().dropna()
-            if grouped.empty:
-                logger.debug("After binning, no non-empty bins for terminator count %d, skipping", tc)
-                continue
-            # compute bin midpoints for x-axis
-            grouped["bin_mid"] = grouped["entropy_bin"].apply(lambda b: (b.left + b.right) / 2)
-            x = grouped["bin_mid"].values
-            y = grouped["num_gadgets"].values
-            color = colors[idx % len(colors)] if colors else None
 
-            # plot the binned averages
-            plt.plot(x, y, marker="o", linestyle="-", label=f"Terminators = {tc}", color=color)
+            coeffs = np.polyfit(x, y, deg=regression_degree)
+            poly = np.poly1d(coeffs)
+            x_range = np.linspace(x.min(), x.max(), 200)
+            y_pred = poly(x_range)
+            plt.plot(x_range, y_pred, color=colors[idx], lw=2, label=f"Term {tc}")
 
-            # add a linear trend line (degree=1). Only add if we have at least 2 points.
-            if len(x) >= 2:
-                # Fit a 1st-degree polynomial (linear)
-                coeffs = np.polyfit(x, y, deg=1)
-                trend_y = np.polyval(coeffs, x)
-                # plot trend as dashed line with same color (or slightly darker)
-                plt.plot(x, trend_y, linestyle="--", color=color, alpha=0.8)
+        # Overall trend
+        coeffs = np.polyfit(df["entropy_percent"], df["num_gadgets"], deg=regression_degree)
+        poly = np.poly1d(coeffs)
+        x_range = np.linspace(df["entropy_percent"].min(), df["entropy_percent"].max(), 200)
+        y_pred = poly(x_range)
+        plt.plot(x_range, y_pred, color="black", lw=3, linestyle="--", label="Overall")
 
-            logger.debug("Plotted terminator count %d (%d bins)", tc, len(grouped))
+        # Confidence interval for overall
+        x_ci, lower, upper = _bootstrap_confidence_interval(
+            df["entropy_percent"].values, df["num_gadgets"].values, regression_degree
+        )
+        plt.fill_between(x_ci, lower, upper, color="black", alpha=0.15)
 
-        plt.title("Average Number of ROP Gadgets vs Entropy Percentage\n(Separate lines per terminator count)")
+        plt.title("ROP Gadgets vs Entropy Percentage", fontsize=18)
         plt.xlabel("Entropy Percentage (%)")
-        plt.ylabel("Average Number of Gadgets")
-        plt.grid(True)
-        plt.legend(title="Terminator Count", loc="best", fontsize="small")
+        plt.ylabel("Number of ROP Gadgets")
+        plt.grid(True, alpha=0.3)
+        plt.legend(title="Legend", bbox_to_anchor=(1.02, 1), loc='upper left')
         plt.tight_layout()
-        plt.savefig(graph_fname)
+        plt.savefig(graph_fname, dpi=300, bbox_inches="tight")
         plt.close()
-        logger.info("Combined plot saved: %s", graph_fname)
+        logger.info(f"Plot saved: {graph_fname}")
 
 
-configure_logging(logging.INFO)
+    def graph_gadgets_vs_entropy_multi_line( 
+        self, 
+        data_points_per_count = 50, 
+        top_terminator_counts = 10, 
+        num_sample_insts = 500, 
+        graph_fname = "gadgets_vs_entropy_multi_line.png",
+        regression_degree = 1,
+        show_points = False 
+    ): 
+        df, stats_df, target_counts = self.analyze_gadgets_vs_entropy( 
+            data_points_per_count=data_points_per_count, 
+            num_sample_insts=num_sample_insts, 
+            top_terminator_counts=top_terminator_counts
+        ) 
+        self.plot_gadgets_vs_entropy(
+            df, 
+            stats_df, 
+            graph_fname=graph_fname,
+            regression_degree=regression_degree, 
+            show_points=show_points,
+            top_n = top_terminator_counts
+        )
+
+
+configure_logging()
